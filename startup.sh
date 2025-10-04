@@ -1,86 +1,119 @@
-# name this file as "startup.sh" and call it from "startup command" as "/home/startup.sh"
-# check out my YouTube video "https://youtu.be/-PGhVFsOnGA"
-# cp /home/default /etc/nginx/sites-enabled/default
+#!/usr/bin/env bash
+# Hardened Azure App Service startup for Laravel (Linux)
+set -euo pipefail
 
-# cp /home/php.ini /usr/local/etc/php/conf.d/php.ini
+log() { echo "[startup] $*"; }
 
+# -----------------------------
+# 0) Env flags (configure in App Settings per environment)
+# -----------------------------
+: "${RUN_MIGRATIONS:=0}"         # 1 to run php artisan migrate --force
+: "${RUN_SEEDERS:=0}"            # 1 to run your custom seeders
+: "${WARM_CACHES:=1}"            # 1 to (re)build route/config/view caches
+: "${START_QUEUE_WORKER:=0}"     # 1 to start queue:work
+: "${START_SCHEDULER:=0}"        # 1 to start schedule:work
+: "${APP_ARTISAN:=/home/site/wwwroot/artisan}"
 
-# install support for webp file conversion
-apt-get update --allow-releaseinfo-change && apt-get install -y libfreetype6-dev \
-                libjpeg62-turbo-dev \
-                libpng-dev \
-                libwebp-dev \
-        && docker-php-ext-configure gd --with-freetype --with-webp  --with-jpeg
-docker-php-ext-install gd
+# -----------------------------
+# 1) Writable paths + symlinks (works with Run-From-Package)
+# -----------------------------
+RFP="${WEBSITE_RUN_FROM_PACKAGE:-1}"
 
-# install support for queue
-apt-get install -y supervisor 
+if [ "$RFP" = "1" ]; then
+  log "Run-From-Package detected: wiring /home writable dirs and symlinks"
+  mkdir -p /home/laravel/storage/framework/{views,cache/data,sessions} /home/laravel/bootstrap/cache
+  # Link storage
+  [ -L /home/site/wwwroot/storage ] || rm -rf /home/site/wwwroot/storage || true
+  [ -e /home/site/wwwroot/storage ] || ln -s /home/laravel/storage /home/site/wwwroot/storage
+  # Link bootstrap/cache
+  mkdir -p /home/site/wwwroot/bootstrap || true
+  [ -L /home/site/wwwroot/bootstrap/cache ] || rm -rf /home/site/wwwroot/bootstrap/cache || true
+  [ -e /home/site/wwwroot/bootstrap/cache ] || ln -s /home/laravel/bootstrap/cache /home/site/wwwroot/bootstrap/cache
 
-cp /home/laravel-worker.conf /etc/supervisor/conf.d/laravel-worker.conf
-cp /home/laravel-scheduler.conf /etc/supervisor/conf.d/laravel-scheduler.conf
+  # Force Blade compiled views path so it never guesses wrong
+  export VIEW_COMPILED_PATH=/home/laravel/storage/framework/views
+else
+  log "Writable code mount detected: ensuring in-place dirs exist"
+  mkdir -p /home/site/wwwroot/storage/framework/{views,cache/data,sessions} /home/site/wwwroot/bootstrap/cache
+  export VIEW_COMPILED_PATH=/home/site/wwwroot/storage/framework/views
+fi
 
-# Restart the php engine of the server
-echo "Restarting php-fpm..."
-pkill -o -USR2 php-fpm
-echo ""
-echo "php-fpm restarted"
-echo ""
+# Best-effort permissions (php-fpm user is typically www-data)
+chown -R www-data:www-data /home/laravel 2>/dev/null || true
+chmod -R 775 /home/laravel 2>/dev/null || true
+chmod -R 775 /home/site/wwwroot/{storage,bootstrap/cache} 2>/dev/null || true
 
-# restart nginx
-service nginx restart
-service supervisor restart
+# -----------------------------
+# 2) Nginx: validate and reload (no service restarts)
+# -----------------------------
+if nginx -t >/dev/null 2>&1; then
+  log "Reloading nginx"
+  nginx -s reload || true
+else
+  log "nginx config test failed (skipping reload)"; true
+fi
 
+# -----------------------------
+# 3) Remove Azure default page (if present)
+# -----------------------------
+if [ -f /home/site/wwwroot/hostingstart.html ]; then
+  log "Removing hostingstart.html"
+  rm -f /home/site/wwwroot/hostingstart.html || true
+fi
 
-php /home/site/wwwroot/artisan down --refresh=15 --secret="1630542a-246b-4b66-afa1-dd72a4c43515"
+# -----------------------------
+# 4) Optional maintenance + app warmup (controlled via flags)
+#    Keep boot fast; only do what you explicitly enable.
+# -----------------------------
+php_bin="$(command -v php || echo php)"
 
-php /home/site/wwwroot/artisan migrate --force
+if [ "$WARM_CACHES" = "1" ]; then
+  log "Clearing runtime caches"
+  $php_bin "$APP_ARTISAN" cache:clear || true
+  $php_bin "$APP_ARTISAN" config:clear || true
+  $php_bin "$APP_ARTISAN" route:clear || true
+  $php_bin "$APP_ARTISAN" view:clear || true
 
-# Clear caches
-php /home/site/wwwroot/artisan cache:clear
-php /home/site/wwwroot/artisan optimize:clear
+  log "Rebuilding caches"
+  $php_bin "$APP_ARTISAN" route:cache || true
+  $php_bin "$APP_ARTISAN" config:cache || true
+  $php_bin "$APP_ARTISAN" view:cache || true
+else
+  log "Skipping cache warmup (WARM_CACHES=0)"
+fi
 
-php /home/site/wwwroot/artisan config:clear
-php /home/site/wwwroot/artisan route:clear
-php /home/site/wwwroot/artisan route:clear
+if [ "$RUN_MIGRATIONS" = "1" ]; then
+  log "Running database migrations"
+  $php_bin "$APP_ARTISAN" migrate --force
+else
+  log "Skipping migrations (RUN_MIGRATIONS=0)"
+fi
 
-# Clear expired password reset tokens
-#php /home/site/wwwroot/artisan auth:clear-resets
-# php /home/site/wwwroot/artisan key:generate
+if [ "$RUN_SEEDERS" = "1" ]; then
+  log "Running custom app tasks/seeders"
+  # Example custom commands from your original script. Toggle as needed.
+  $php_bin "$APP_ARTISAN" app:change-paynamic-environment || true
+  $php_bin "$APP_ARTISAN" app:gps-seeder || true
+  $php_bin "$APP_ARTISAN" db:seed --class=DragonCredentials || true
+else
+  log "Skipping seeders/custom tasks (RUN_SEEDERS=0)"
+fi
 
-# Update the paynamics environment in the database
-php /home/site/wwwroot/artisan app:change-paynamic-environment
+# -----------------------------
+# 5) Optional workers (web container usually shouldn't, but supported via flags)
+# -----------------------------
+if [ "$START_QUEUE_WORKER" = "1" ]; then
+  log "Starting queue worker"
+  nohup $php_bin "$APP_ARTISAN" queue:work --sleep=3 --tries=3 >/home/LogFiles/queue.work.log 2>&1 &
+else
+  log "Queue worker disabled (START_QUEUE_WORKER=0)"
+fi
 
-php /home/site/wwwroot/artisan app:gps-seeder
+if [ "$START_SCHEDULER" = "1" ]; then
+  log "Starting scheduler"
+  nohup $php_bin "$APP_ARTISAN" schedule:work >/home/LogFiles/schedule.work.log 2>&1 &
+else
+  log "Scheduler disabled (START_SCHEDULER=0)"
+fi
 
-# Clear and cache routes
-php /home/site/wwwroot/artisan route:cache
-
-# Clear and cache config
-php /home/site/wwwroot/artisan config:cache
-
-# Clear and cache views
-php /home/site/wwwroot/artisan view:cache
-
-# Clear and cache views
-php /home/site/wwwroot/artisan db:seed --class=DragonCredentials
-
-# Install node modules
-# npm ci
-
-# Build assets using Laravel Mix
-# npm run production --silent
-
-# uncomment next line if you dont have S3 or Blob storage
-#php /home/site/wwwroot/artisan storage:link
-
-# Turn off maintenance mode
-php /home/site/wwwroot/artisan up
-
-# run worker
-nohup php /home/site/wwwroot/artisan queue:work &
-
-# run scheduler
-nohup php /home/site/wwwroot/artisan schedule:work &
-
-# Remove default azure app service page
-rm /home/site/wwwroot/hostingstart.html
+log "Startup complete"
